@@ -1,10 +1,10 @@
-# Echidna Shrink Bug: `removeReverts` Breaks `block.number` in Shrunk Reproducers
+# Echidna Shrink Bug: `removeReverts` Breaks `block.number` and `block.timestamp` in Shrunk Reproducers
 
 ## Summary
 
-When Echidna shrinks a failing call sequence, `removeReverts` replaces reverting transactions with `NoCall` entries. However, in the **original execution**, reverting calls had their `block.number` and `block.timestamp` advances **rolled back** by the EVM state restoration in `handleErrorsAndConstruction`. The `NoCall` replacements return `VMSuccess` and never trigger this rollback, so block advances **stick** -- giving the shrunk reproducer a **higher `block.number`** than the original run.
+When Echidna shrinks a failing call sequence, `removeReverts` replaces reverting transactions with `NoCall` entries. However, in the **original execution**, reverting calls had their `block.number` and `block.timestamp` advances **rolled back** by the EVM state restoration in `handleErrorsAndConstruction`. The `NoCall` replacements return `VMSuccess` and never trigger this rollback, so block advances **stick** -- giving the shrunk reproducer **higher `block.number` and `block.timestamp`** than the original run.
 
-Any invariant or assertion that depends on exact `block.number` (e.g., RNG based on `keccak256(abi.encode(block.number))`) will fail to reproduce from the shrunk call sequence.
+Any invariant or assertion that depends on exact `block.number` or `block.timestamp` (e.g., RNG based on `keccak256(abi.encode(block.number))`) will fail to reproduce from the shrunk call sequence.
 
 ## Root Cause
 
@@ -28,7 +28,7 @@ case tx.call of
 
 ## Impact
 
-- **Shrunk reproducers have incorrect `block.number`**: inflated by the sum of all block delays from formerly-reverting calls
+- **Shrunk reproducers have incorrect `block.number` and `block.timestamp`**: inflated by the sum of all block/time delays from formerly-reverting calls
 - **Shrinking always fails**: `removeReverts` runs first, producing a non-reproducing base sequence. All subsequent `shrinkSeq` attempts are variations of this broken sequence, so all 500 (default `shrinkLimit`) attempts fail
 - **Silent failure**: Echidna reports a "reproducer" that does not actually reproduce the finding. The displayed call sequence and the traces come from different executions
 - **Affects `block.timestamp` too**: same `put vmBeforeTx` mechanism rolls back timestamp, so time delays from `*wait*` entries are also technically incorrect
@@ -71,7 +71,7 @@ All 500 shrink attempts fail because the base sequence (post-`removeReverts`) do
 forge test -vv
 ```
 
-Two tests demonstrate the divergence:
+#### block.number variant (`ShrinkBug.sol`)
 
 - **`test_replay_with_waits` PASSES** -- replays the shrunk reproducer exactly as Echidna outputs it, including `vm.roll` for `*wait*` entries. `block.number` is inflated, `keccak256` hash changes, assertion does not fire. **The shrunk reproducer does not reproduce the bug.**
 
@@ -89,17 +89,36 @@ Two tests demonstrate the divergence:
 
 The difference: 4822266 - 4566221 = **256045 blocks** -- exactly the sum of the three `*wait*` block delays (189689 + 61336 + 5020).
 
-## The Contract
+#### block.timestamp variant (`ShrinkBugTimestamp.sol`)
 
-`ShrinkBug.sol` is minimal:
+Same pattern but for `block.timestamp`:
+
+```
+[PASS] test_replay_with_waits()
+  block.timestamp at final fuzz_withdraw: 1527256961
+  keccak mode: 121
+
+[FAIL: panic: assertion failed (0x01)] test_replay_without_waits()
+  block.timestamp at final fuzz_withdraw: 1526108034
+  keccak mode: 42
+```
+
+The difference: 1527256961 - 1526108034 = **1148927 seconds** -- exactly the sum of the three `*wait*` time delays (31594 + 653745 + 463588).
+
+## The Contracts
+
+Both contracts follow the same pattern:
 
 - `fuzz_deposit(amount)` -- reverts for `amount < 10` (~50% of fuzzer inputs), succeeds otherwise
-- `fuzz_withdraw()` -- uses `keccak256(abi.encode(block.number)) % 997` as RNG; asserts `mode != 42`
+- `fuzz_withdraw()` -- uses `keccak256(abi.encode(block.number))` or `keccak256(abi.encode(block.timestamp))` as RNG with `% 997`; asserts `mode != 42`
 
-When `fuzz_deposit` calls revert during fuzzing, Echidna's original execution rolls back their block advances. After `removeReverts` converts them to `NoCall`, the advances stick, inflating `block.number` by the sum of their block delays.
+When `fuzz_deposit` calls revert during fuzzing, Echidna's original execution rolls back their block/time advances. After `removeReverts` converts them to `NoCall`, the advances stick, inflating the values by the sum of their delays.
 
 ## Files
 
-- `src/ShrinkBug.sol` -- minimal contract demonstrating the bug
-- `test/ReplayShrunkReproducer.t.sol` -- Forge test proving the shrunk reproducer fails to reproduce
-- `echidna.yaml` -- Echidna configuration
+- `src/ShrinkBug.sol` -- minimal contract demonstrating the block.number bug
+- `src/ShrinkBugTimestamp.sol` -- minimal contract demonstrating the block.timestamp bug
+- `test/ReplayShrunkReproducer.t.sol` -- Forge test for block.number variant
+- `test/ReplayShrunkTimestamp.t.sol` -- Forge test for block.timestamp variant
+- `echidna.yaml` -- Echidna configuration (block.number variant)
+- `echidna-timestamp.yaml` -- Echidna configuration (block.timestamp variant)
